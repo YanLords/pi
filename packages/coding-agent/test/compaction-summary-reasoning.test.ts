@@ -96,6 +96,19 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
+	it("applies before-provider payload transforms to summarization", async () => {
+		const transform = vi.fn(async (payload: unknown) => {
+			const context = payload as TranscriptContext;
+			return { ...context, systemPrompt: `${context.systemPrompt}\n[redacted]` };
+		});
+
+		await generateSummary(messages, createModel(false), 2000, "test-key", undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, transform);
+
+		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(transform).toHaveBeenCalledTimes(1);
+		expect(requestContext.systemPrompt).toContain("[redacted]");
+	});
+
 	it("preserves the string result from generateSummary", async () => {
 		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).resolves.toBe(
 			"## Goal\nTest summary",

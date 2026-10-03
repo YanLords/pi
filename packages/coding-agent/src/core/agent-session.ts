@@ -2691,6 +2691,11 @@ export class AgentSession {
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
+			async (payload) => {
+				const runner = this._extensionRunner;
+				if (!runner?.hasHandlers("before_provider_request")) return payload;
+				return runner.emitBeforeProviderRequest(payload);
+			},
 		);
 	}
 
