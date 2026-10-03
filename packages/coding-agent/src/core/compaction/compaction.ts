@@ -623,6 +623,7 @@ export async function completeSummarization(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onPayload?: (payload: unknown) => Promise<unknown>,
 ): Promise<AssistantMessage> {
 	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
 	// callers without a session ID, including branch summaries, receive a fresh routing ID.
@@ -631,10 +632,12 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
+	const produce = async (): Promise<AssistantMessage> => {
+		const transformedContext = onPayload ? ((await onPayload(context)) as TranscriptContext) : context;
+		return streamFn
+			? (await streamFn(model, transformedContext, requestOptions)).result()
+			: completeSimple(model, transformedContext, requestOptions);
+	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
@@ -657,6 +660,7 @@ export async function generateSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: (payload: unknown) => Promise<unknown>,
 ): Promise<string> {
 	return (
 		await generateSummaryWithUsage(
@@ -674,6 +678,7 @@ export async function generateSummary(
 			retry,
 			callbacks,
 			sessionId,
+			onPayload,
 		)
 	).text;
 }
@@ -708,6 +713,7 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: (payload: unknown) => Promise<unknown>,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -750,6 +756,7 @@ export async function generateSummaryWithUsage(
 		streamFn,
 		retry,
 		callbacks,
+		onPayload,
 	);
 
 	const failure = getSummarizationFailure(response, "Summarization");
@@ -975,6 +982,7 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: (payload: unknown) => Promise<unknown>,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1010,6 +1018,7 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				onPayload,
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -1048,6 +1057,7 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			onPayload,
 		);
 		summary = result.text;
 		summaryUsage = result.usage;

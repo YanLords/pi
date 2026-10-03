@@ -874,7 +874,10 @@ export interface ContextWithSystemEvent {
 	messages: AgentMessage[];
 }
 
-/** Fired before a provider request is sent. Can replace the payload. */
+/**
+ * Fired before every provider request, including internal compaction and summarization calls.
+ * Can replace the payload.
+ */
 export interface BeforeProviderRequestEvent {
 	type: "before_provider_request";
 	payload: unknown;
