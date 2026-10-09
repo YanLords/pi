@@ -1,0 +1,100 @@
+name: agon
+
+on:
+  push:
+    branches: [main, "agon-*"]
+    paths: ["packages/agon/**", ".github/workflows/agon.yml", ".github/workflows/agon-daemons.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["packages/agon/**", ".github/workflows/agon.yml", ".github/workflows/agon-daemons.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: agon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  daemons:
+    uses: ./.github/workflows/agon-daemons.yml
+    permissions:
+      contents: read
+
+  check:
+    needs: daemons
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Check
+        run: npm run check
+
+      - name: Download the agon daemons
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: agon-*
+          path: packages/agon/bin
+
+      - name: Check the agon package contents
+        working-directory: packages/agon
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+            const files = new Set(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))[0].files.map((file) => file.path));
+            const expected = ["dist/index.js", "dist/index.d.ts", "dist/cli.js", "README.md", "CHANGELOG.md"];
+            for (const name of ["linux-x64", "linux-arm64", "android-arm64", "android-x64", "darwin-arm64", "darwin-x64"]) expected.push(`bin/agon-${name}/agon`);
+            for (const name of ["windows-x64", "windows-arm64"]) expected.push(`bin/agon-${name}/agon.exe`);
+            const missing = expected.filter((file) => !files.has(file));
+            const unexpected = [...files].filter((file) => file.startsWith("src/") || file.startsWith("daemon/") || file.startsWith("test/"));
+            if (missing.length || unexpected.length) { console.error({ missing, unexpected }); process.exit(1); }
+            console.log(`${files.size} files`);
+          ' "$RUNNER_TEMP/pack.json"
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Daemon format, lint and unit tests
+        working-directory: packages/agon/daemon
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build the daemon
+        working-directory: packages/agon
+        run: npm run build:daemon
+
+      - name: agon tests
+        working-directory: packages/agon
+        run: npm test

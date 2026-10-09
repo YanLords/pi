@@ -1,0 +1,69 @@
+{
+	"name": "@earendil-works/pi-agon",
+	"version": "1.1.0",
+	"description": "Deterministic safety invariants and verifiable verification kernel for Pi",
+	"type": "module",
+	"bin": {
+		"agon": "./dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"source": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"pi": {
+		"extensions": [
+			"./dist/index.js"
+		]
+	},
+	"sideEffects": false,
+	"files": [
+		"dist",
+		"bin",
+		"docs",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "npm run build:extension && npm run build:daemon",
+		"build:offline": "npm run build:extension",
+		"build:extension": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+		"build:daemon": "cargo build --release --locked --manifest-path daemon/Cargo.toml && node scripts/copy-daemon.mjs",
+		"test": "vitest --run",
+		"check": "tsc --noEmit",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"keywords": [
+		"agon",
+		"verification",
+		"invariants",
+		"safety",
+		"agent"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/agon"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"typebox": "1.3.27"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"shx": "0.3.4",
+		"typebox": "1.3.27",
+		"vitest": "4.1.11"
+	}
+}

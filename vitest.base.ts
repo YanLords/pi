@@ -29,6 +29,7 @@ export const workspaceSourcePaths = {
 	serverUnix: fileURLToPath(new URL("./packages/server/src/transports/unix/index.ts", import.meta.url)),
 	codingAgentIndex: fileURLToPath(new URL("./packages/coding-agent/src/index.ts", import.meta.url)),
 	tuiIndex: fileURLToPath(new URL("./packages/tui/src/index.ts", import.meta.url)),
+	agonIndex: fileURLToPath(new URL("./packages/agon/src/index.ts", import.meta.url)),
 } as const;
 
 export default defineConfig({
@@ -69,6 +70,7 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-server$/, replacement: workspaceSourcePaths.serverIndex },
 			{ find: /^@earendil-works\/pi-server\/unix$/, replacement: workspaceSourcePaths.serverUnix },
 			{ find: /^@earendil-works\/pi-tui$/, replacement: workspaceSourcePaths.tuiIndex },
+			{ find: /^@earendil-works\/pi-agon$/, replacement: workspaceSourcePaths.agonIndex },
 		],
 	},
 });

@@ -1,0 +1,30 @@
+[package]
+name = "agon-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "agon_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agon-bridge"
+path = "src/main.rs"
+
+[dependencies]
+agon-core.workspace = true
+agon-policy.workspace = true
+agon-morph.workspace = true
+agon-verify.workspace = true
+agon-model.workspace = true
+agon-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+agon-core = { workspace = true, features = ["test-util"] }

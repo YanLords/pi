@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agon-core",
+    "crates/agon-kernel",
+    "crates/agon-policy",
+    "crates/agon-morph",
+    "crates/agon-verify",
+    "crates/agon-model",
+    "crates/agon-bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+toml = "=0.8.20"
+sha2 = "=0.10.9"
+hex = "=0.4.3"
+regex = "=1.12.3"
+thiserror = "=2.0.18"
+tokio = { version = "=1.53.1", features = ["rt", "macros", "net", "io-util", "time", "sync", "signal"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+agon-core = { path = "crates/agon-core" }
+agon-policy = { path = "crates/agon-policy" }
+agon-morph = { path = "crates/agon-morph" }
+agon-verify = { path = "crates/agon-verify" }
+agon-model = { path = "crates/agon-model" }
+agon-kernel = { path = "crates/agon-kernel" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
