@@ -248,20 +248,23 @@ export class AgonBridge {
 			});
 
 			this.process = child;
+			let stderrOutput = "";
 
 			child.stdout?.on("data", (chunk: Buffer) => {
 				this.handleIncomingData(chunk);
 			});
 
-			child.stdout?.on("end", () => {
-				if (!this.isClosed && this.pendingRequests.size > 0) {
-					this.handleProcessTermination(new Error("Agon daemon bridge stream ended unexpectedly (EOF)"));
-				}
-			});
-
 			child.stderr?.on("data", (chunk: Buffer) => {
 				const text = chunk.toString("utf8");
+				stderrOutput += text;
 				this.onLog?.(text);
+			});
+
+			child.stdout?.on("end", () => {
+				if (!this.isClosed && this.pendingRequests.size > 0) {
+					const reason = stderrOutput.trim() ? `: ${stderrOutput.trim()}` : "";
+					this.handleProcessTermination(new Error(`Agon daemon bridge stream ended unexpectedly (EOF)${reason}`));
+				}
 			});
 
 			child.on("error", (err) => {
@@ -269,8 +272,9 @@ export class AgonBridge {
 			});
 
 			child.on("exit", (code, signal) => {
+				const reason = stderrOutput.trim() ? `: ${stderrOutput.trim()}` : "";
 				const err = new Error(
-					`Agon daemon exited unexpectedly with code ${code ?? "unknown"} and signal ${signal ?? "none"}`,
+					`Agon daemon exited unexpectedly with code ${code ?? "unknown"} and signal ${signal ?? "none"}${reason}`,
 				);
 				this.handleProcessTermination(err);
 			});

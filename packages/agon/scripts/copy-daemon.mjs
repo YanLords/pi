@@ -1,7 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
 const packageRoot = join(fileURLToPath(new URL("..", import.meta.url)));
 
 const platform = process.platform === "win32" ? "windows" : process.platform;
@@ -22,6 +22,14 @@ mkdirSync(destDir, { recursive: true });
 copyFileSync(src, dest);
 if (platform !== "windows") {
 	chmodSync(dest, 0o755);
+}
+
+if (process.platform === "darwin") {
+	try {
+		execFileSync("codesign", ["-s", "-", "-f", dest]);
+	} catch {
+		// Ignore if codesign is unavailable
+	}
 }
 
 console.log(`Copied ${src} to ${dest}`);
