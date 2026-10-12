@@ -193,6 +193,10 @@ export function hasTrustRequiringProjectResources(cwd: string): boolean {
 		return true;
 	}
 
+	if (existsSync(join(currentDir, ".agon"))) {
+		return true;
+	}
+
 	while (true) {
 		const agentsSkillsDir = join(currentDir, ".agents", "skills");
 		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {

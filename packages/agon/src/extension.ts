@@ -5,16 +5,15 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
-	ToolResultEvent,
-	ToolResultEventResult,
 	UIPromptStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { AgonBridge, type AgonRepairResult, type AgonVerifyResult } from "./bridge.ts";
+import { AgonBridge, type AgonVerifyResult } from "./bridge.ts";
 
-import { clearAlertNotification, sendAlertNotification } from "./notify.ts";
+import { AlertController, isDesktopAlertEnabled } from "./notify.ts";
 
 interface ToolActionMapping {
 	action: "read" | "search" | "write" | "edit" | "shell";
@@ -48,6 +47,10 @@ function mapToolCall(event: ToolCallEvent): ToolActionMapping | null {
 			return { action: "edit", detail: path };
 		}
 		case "bash": {
+			const command = typeof event.input?.command === "string" ? event.input.command : "";
+			return { action: "shell", detail: command };
+		}
+		case "powershell": {
 			const command = typeof event.input?.command === "string" ? event.input.command : "";
 			return { action: "shell", detail: command };
 		}
@@ -142,21 +145,17 @@ export function initAgon(cwd: string): { created: string[]; kept: string[] } {
 
 async function createBridge(ctx: ExtensionContext): Promise<AgonBridge> {
 	const env: NodeJS.ProcessEnv = {};
-	try {
-		const openRouterKey = await ctx.modelRegistry?.getApiKeyForProvider("openrouter");
+	if (ctx.modelRegistry) {
+		const [openRouterKey, typesafeKey] = await Promise.all([
+			ctx.modelRegistry.getApiKeyForProvider("openrouter").catch(() => undefined),
+			ctx.modelRegistry.getApiKeyForProvider("typesafe").catch(() => undefined),
+		]);
 		if (openRouterKey) {
 			env.OPENROUTER_API_KEY = openRouterKey;
 		}
-	} catch {
-		// Ignore
-	}
-	try {
-		const typesafeKey = await ctx.modelRegistry?.getApiKeyForProvider("typesafe");
 		if (typesafeKey) {
 			env.TYPESAFE_API_KEY = typesafeKey;
 		}
-	} catch {
-		// Ignore
 	}
 
 	return new AgonBridge({
@@ -172,54 +171,133 @@ async function createBridge(ctx: ExtensionContext): Promise<AgonBridge> {
 
 export function agonExtension(pi: ExtensionAPI): void {
 	let bridge: AgonBridge | null = null;
+	let bridgeStartPromise: Promise<AgonBridge> | null = null;
 	let hasAgon = false;
 	let isRepairActive = false;
+	const alertController = new AlertController();
+
+	async function ensureBridge(ctx: ExtensionContext): Promise<AgonBridge> {
+		const agonDir = join(ctx.cwd, ".agon");
+		hasAgon = existsSync(agonDir);
+		if (!hasAgon) {
+			throw new Error("Agon is not configured in this directory (.agon missing).");
+		}
+		if (!ctx.isProjectTrusted()) {
+			throw new Error("Project is not trusted: Agon sidecar disabled.");
+		}
+
+		if (bridge) {
+			if (bridge.cwd === ctx.cwd && bridge.isRunning) {
+				return bridge;
+			}
+			const oldBridge = bridge;
+			bridge = null;
+			bridgeStartPromise = null;
+			await oldBridge.shutdown().catch(() => {});
+		}
+
+		if (bridgeStartPromise) {
+			return bridgeStartPromise;
+		}
+
+		bridgeStartPromise = (async () => {
+			try {
+				const newBridge = await createBridge(ctx);
+				await newBridge.start();
+				bridge = newBridge;
+				return newBridge;
+			} finally {
+				bridgeStartPromise = null;
+			}
+		})();
+
+		return bridgeStartPromise;
+	}
 
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		const agonDir = join(ctx.cwd, ".agon");
 		hasAgon = existsSync(agonDir);
 
 		if (!hasAgon) {
-			bridge = null;
+			if (bridge) {
+				const old = bridge;
+				bridge = null;
+				bridgeStartPromise = null;
+				void old.shutdown().catch(() => {});
+			}
 			return;
 		}
 
-		try {
-			bridge = await createBridge(ctx);
-			await bridge.start();
-		} catch (err) {
+		if (!ctx.isProjectTrusted()) {
+			if (bridge) {
+				const old = bridge;
+				bridge = null;
+				bridgeStartPromise = null;
+				void old.shutdown().catch(() => {});
+			}
+			if (ctx.hasUI) {
+				ctx.ui.notify("Agon sidecar not started: project is not trusted.", "warning");
+			}
+			return;
+		}
+
+		void ensureBridge(ctx).catch((err) => {
 			const message = err instanceof Error ? err.message : String(err);
 			if (ctx.hasUI) {
 				ctx.ui.notify(`Failed to start Agon sidecar: ${message}`, "error");
 			}
-		}
+		});
 	});
 
-	pi.on("session_shutdown", async () => {
-		if (bridge) {
-			const active = bridge;
-			bridge = null;
-			await active.shutdown();
+	pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
+		if (event.reason === "quit") {
+			if (bridge) {
+				const active = bridge;
+				bridge = null;
+				bridgeStartPromise = null;
+				await active.shutdown();
+			}
 		}
 	});
-	pi.on("ui_prompt_start", (event: UIPromptStartEvent) => {
+	pi.on("ui_prompt_start", (event: UIPromptStartEvent, ctx: ExtensionContext) => {
+		const isTui = ctx.mode === "tui";
 		const kindLabel = event.kind === "confirm" ? "Confirmation demandée" : "Saisie requise";
-		sendAlertNotification("Pi", event.title ? `${kindLabel}: ${event.title}` : "Pi attend votre réponse");
+		const title = event.title ? `${kindLabel}: ${event.title}` : "Pi attend votre réponse";
+
+		alertController.transition(
+			"awaiting_input",
+			() => {
+				if (isTui) {
+					ctx.ui.notify(title, "info");
+				}
+			},
+			{ title: "Pi", message: title },
+		);
 	});
 
-	pi.on("agent_settled", (event: AgentSettledEvent) => {
-		if (!event.aborted) {
-			sendAlertNotification("Pi", "Tâche terminée, en attente de vos instructions");
-		}
+	pi.on("agent_settled", (event: AgentSettledEvent, ctx: ExtensionContext) => {
+		if (event.aborted) return;
+		const isTui = ctx.mode === "tui";
+		const message = "Tâche terminée, en attente de vos instructions";
+
+		alertController.transition(
+			"settled",
+			() => {
+				if (isTui) {
+					ctx.ui.notify(message, "info");
+				}
+			},
+			{ title: "Pi", message },
+		);
 	});
+
 	pi.on("ui_prompt_end", () => {
-		clearAlertNotification();
+		alertController.transition("idle");
 	});
 
 	pi.on("turn_start", () => {
-		clearAlertNotification();
+		alertController.transition("idle");
 	});
-
 	pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
 		if (!hasAgon) {
 			return undefined;
@@ -230,18 +308,31 @@ export function agonExtension(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
-		if (!bridge) {
+		if (!ctx.isProjectTrusted()) {
 			if (mapped.action === "read" || mapped.action === "search") {
 				return undefined;
 			}
 			return {
 				block: true,
-				reason: "Agon daemon bridge unavailable: mutative action blocked for safety.",
+				reason: "Project is not trusted: mutative action blocked for safety.",
+			};
+		}
+
+		let activeBridge: AgonBridge;
+		try {
+			activeBridge = await ensureBridge(ctx);
+		} catch (err) {
+			if (mapped.action === "read" || mapped.action === "search") {
+				return undefined;
+			}
+			return {
+				block: true,
+				reason: `Agon daemon bridge unavailable: mutative action blocked for safety (${err instanceof Error ? err.message : String(err)}).`,
 			};
 		}
 
 		try {
-			const auth = await bridge.authorize(mapped.action, mapped.detail);
+			const auth = await activeBridge.authorize(mapped.action, mapped.detail);
 			if (auth.verdict === "deny") {
 				return {
 					block: true,
@@ -257,15 +348,17 @@ export function agonExtension(pi: ExtensionAPI): void {
 					};
 				}
 
-				sendAlertNotification(
-					"Pi / Agon",
-					auth.reason ?? `Confirmation requise: ${mapped.action} (${mapped.detail})`,
-				);
+				if (isDesktopAlertEnabled()) {
+					alertController.sendDesktop(
+						"Pi / Agon",
+						auth.reason ?? `Confirmation requise: ${mapped.action} (${mapped.detail})`,
+					);
+				}
 				const confirmed = await ctx.ui.confirm(
 					"Agon Policy Confirmation",
 					auth.reason ?? `Confirm ${mapped.action}: ${mapped.detail}`,
 				);
-				clearAlertNotification();
+				alertController.reset();
 
 				if (!confirmed) {
 					return {
@@ -287,13 +380,6 @@ export function agonExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("tool_result", (event: ToolResultEvent): ToolResultEventResult | undefined => {
-		if (event.toolName === "agon_verify") {
-			return undefined;
-		}
-		return undefined;
-	});
-
 	pi.registerCommand("agon", {
 		description: "Agon safety kernel commands: status, verify, repair, reset",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -304,10 +390,7 @@ export function agonExtension(pi: ExtensionAPI): void {
 				const result = initAgon(ctx.cwd);
 				hasAgon = true;
 				try {
-					if (!bridge) {
-						bridge = await createBridge(ctx);
-						await bridge.start();
-					}
+					await ensureBridge(ctx);
 					ctx.ui.notify(
 						`Initialized Agon project in .agon/\nCreated: ${result.created.join(", ") || "none"}\nKept: ${result.kept.join(", ") || "none"}\nNext: define checks in .agon/checks.toml and add them to [form] checks in .agon/config.toml`,
 						"info",
@@ -329,15 +412,21 @@ export function agonExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (!bridge) {
-				ctx.ui.notify("Agon bridge is not currently running", "error");
+			let activeBridge: AgonBridge;
+			try {
+				activeBridge = await ensureBridge(ctx);
+			} catch (e) {
+				ctx.ui.notify(
+					`Agon bridge is not currently running: ${e instanceof Error ? e.message : String(e)}`,
+					"error",
+				);
 				return;
 			}
 
 			switch (subcommand) {
 				case "status": {
 					try {
-						const status = await bridge.status();
+						const status = await activeBridge.status();
 						const violations =
 							status.tampering_violations.length > 0
 								? `\nTampering violations: ${status.tampering_violations.join(", ")}`
@@ -355,13 +444,15 @@ export function agonExtension(pi: ExtensionAPI): void {
 				case "verify": {
 					const checkId = rest[0];
 					try {
-						const res = await bridge.verify(checkId, ctx.signal);
-						const passed = res.passed ? "PASS" : "FAIL";
-						const level = res.passed ? "info" : "error";
-						ctx.ui.notify(
-							`Check ${res.check_id}: ${passed} (exit code ${res.exit_code ?? "none"})\nSignature: ${res.signature.class}`,
-							level,
-						);
+						const results = await activeBridge.verify(checkId, ctx.signal);
+						for (const res of results) {
+							const passed = res.passed ? "PASS" : "FAIL";
+							const level = res.passed ? "info" : "error";
+							ctx.ui.notify(
+								`Check ${res.check_id}: ${passed} (exit code ${res.exit_code ?? "none"})\nSignature: ${res.signature.class}`,
+								level,
+							);
+						}
 					} catch (e) {
 						ctx.ui.notify(`Verification failed: ${e instanceof Error ? e.message : String(e)}`, "error");
 					}
@@ -380,21 +471,23 @@ export function agonExtension(pi: ExtensionAPI): void {
 						return;
 					}
 
-					if (ctx.hasUI) {
-						const confirmed = await ctx.ui.confirm(
-							"Agon Repair Confirmation",
-							`Launch automated Agon kernel repair for check "${checkId}"?`,
-						);
-						if (!confirmed) {
-							ctx.ui.notify("Repair cancelled by user", "info");
-							return;
-						}
+					if (!ctx.hasUI) {
+						ctx.ui.notify("Agon repair requires interactive UI confirmation", "error");
+						return;
+					}
+					const confirmed = await ctx.ui.confirm(
+						"Agon Repair Confirmation",
+						`Launch automated Agon kernel repair for check "${checkId}"?`,
+					);
+					if (!confirmed) {
+						ctx.ui.notify("Repair cancelled by user", "info");
+						return;
 					}
 
 					isRepairActive = true;
 					try {
 						ctx.ui.notify(`Starting Agon repair for ${checkId}...`, "info");
-						const res = await bridge.repair(
+						const res = await activeBridge.repair(
 							checkId,
 							(event, _data) => {
 								ctx.ui.notify(`[Agon] ${event}`, "info");
@@ -417,9 +510,14 @@ export function agonExtension(pi: ExtensionAPI): void {
 						return;
 					}
 					try {
-						await bridge.shutdown();
-						bridge = await createBridge(ctx);
-						await bridge.start();
+						if (bridge) {
+							const old = bridge;
+							bridge = null;
+							bridgeStartPromise = null;
+							await old.shutdown().catch(() => {});
+						}
+						await ensureBridge(ctx);
+						ctx.ui.notify("Agon sidecar restarted successfully", "info");
 					} catch (e) {
 						ctx.ui.notify(`Reset failed: ${e instanceof Error ? e.message : String(e)}`, "error");
 					}
@@ -427,8 +525,19 @@ export function agonExtension(pi: ExtensionAPI): void {
 				}
 				case "notify": {
 					const soundName = rest[0];
-					sendAlertNotification("Pi / Agon", "Test de notification : Pi attend vos instructions", soundName);
-					ctx.ui.notify(`Notification sonore (${soundName || "défaut"}) et visuelle envoyée.`, "info");
+					if (isDesktopAlertEnabled()) {
+						alertController.sendDesktop(
+							"Pi / Agon",
+							"Test de notification : Pi attend vos instructions",
+							soundName,
+						);
+						ctx.ui.notify(`Notification sonore (${soundName || "défaut"}) et visuelle envoyée.`, "info");
+					} else {
+						ctx.ui.notify(
+							`Voie desktop/sonore inactive (activer avec PI_ALERT_DESKTOP=1). Notification UI standard émise: test`,
+							"info",
+						);
+					}
 					break;
 				}
 
@@ -444,10 +553,7 @@ export function agonExtension(pi: ExtensionAPI): void {
 			const result = initAgon(ctx.cwd);
 			hasAgon = true;
 			try {
-				if (!bridge) {
-					bridge = await createBridge(ctx);
-					await bridge.start();
-				}
+				await ensureBridge(ctx);
 				ctx.ui.notify(
 					`Initialized Agon project in .agon/\nCreated: ${result.created.join(", ") || "none"}\nKept: ${result.kept.join(", ") || "none"}\nNext: define checks in .agon/checks.toml and add them to [form] checks in .agon/config.toml`,
 					"info",
@@ -466,7 +572,7 @@ export function agonExtension(pi: ExtensionAPI): void {
 		label: "Agon status",
 		description: "Get current Agon safety status, active checks, lock hash, budget, and tampering violations.",
 		parameters: Type.Object({}),
-		execute: async () => {
+		execute: async (_toolCallId, _params, _signal, _onUpdate, ctx) => {
 			if (!hasAgon) {
 				return {
 					content: [{ type: "text", text: "Agon is not configured (.agon directory missing)." }],
@@ -474,16 +580,25 @@ export function agonExtension(pi: ExtensionAPI): void {
 					isError: false,
 				};
 			}
-			if (!bridge) {
+
+			let activeBridge: AgonBridge;
+			try {
+				activeBridge = await ensureBridge(ctx);
+			} catch (err) {
 				return {
-					content: [{ type: "text", text: "Agon daemon bridge is unavailable." }],
+					content: [
+						{
+							type: "text",
+							text: `Agon daemon bridge is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+						},
+					],
 					details: undefined,
 					isError: true,
 				};
 			}
 
 			try {
-				const status = await bridge.status();
+				const status = await activeBridge.status();
 				return {
 					content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
 					details: status,
@@ -510,7 +625,7 @@ export function agonExtension(pi: ExtensionAPI): void {
 				Type.String({ description: "Optional specific check identifier (e.g. 'verify.build')" }),
 			),
 		}),
-		execute: async (_toolCallId, params) => {
+		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			if (!hasAgon) {
 				return {
 					content: [{ type: "text", text: "Agon is not configured (.agon directory missing)." }],
@@ -518,31 +633,42 @@ export function agonExtension(pi: ExtensionAPI): void {
 					isError: false,
 				};
 			}
-			if (!bridge) {
+			let activeBridge: AgonBridge;
+			try {
+				activeBridge = await ensureBridge(ctx);
+			} catch (err) {
 				return {
-					content: [{ type: "text", text: "Agon daemon bridge is unavailable." }],
+					content: [
+						{
+							type: "text",
+							text: `Agon daemon bridge is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+						},
+					],
 					details: undefined,
 					isError: true,
 				};
 			}
 			try {
-				const res: AgonVerifyResult = await bridge.verify(params.check_id);
-				const stderrSnippet = res.stderr ? res.stderr.split("\n").slice(0, 10).join("\n") : "";
-				const summary = {
-					check_id: res.check_id,
-					passed: res.passed,
-					exit_code: res.exit_code,
-					timed_out: res.timed_out,
-					signature_class: res.signature.class,
-					signature_fields: res.signature.fields,
-					stderr_preview: stderrSnippet,
-					rerun_hint: `Use /agon verify ${res.check_id} to rerun interactively.`,
-				};
+				const results: AgonVerifyResult[] = await activeBridge.verify(params.check_id, signal);
+				const summary = results.map((res) => {
+					const stderrSnippet = res.stderr ? res.stderr.split("\n").slice(0, 10).join("\n") : "";
+					return {
+						check_id: res.check_id,
+						passed: res.passed,
+						exit_code: res.exit_code,
+						timed_out: res.timed_out,
+						signature_class: res.signature.class,
+						signature_fields: res.signature.fields,
+						stderr_preview: stderrSnippet,
+						rerun_hint: `Use /agon verify ${res.check_id} to rerun interactively.`,
+					};
+				});
 
+				const allPassed = results.length > 0 && results.every((r) => r.passed);
 				return {
 					content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
-					details: res,
-					isError: !res.passed,
+					details: results,
+					isError: !allPassed,
 				};
 			} catch (e) {
 				return {
@@ -555,76 +681,6 @@ export function agonExtension(pi: ExtensionAPI): void {
 					details: undefined,
 					isError: true,
 				};
-			}
-		},
-	});
-	pi.registerTool({
-		name: "agon_repair",
-		label: "Agon repair",
-		description:
-			"Trigger an automated causal repair loop on a failing check. Agon reproduces the failure, detects the signature, evaluates candidate mutations (from candidates.toml), verifies causal proof, and commits the validated mutation to the Form and mutation registry.",
-		parameters: Type.Object({
-			check_id: Type.String({
-				description: "Identifier of the check to repair (e.g. 'verify.test')",
-			}),
-		}),
-		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-			if (!hasAgon) {
-				return {
-					content: [{ type: "text", text: "Agon is not configured (.agon directory missing)." }],
-					details: undefined,
-					isError: false,
-				};
-			}
-			if (!bridge) {
-				return {
-					content: [{ type: "text", text: "Agon daemon bridge is unavailable." }],
-					details: undefined,
-					isError: true,
-				};
-			}
-			if (isRepairActive) {
-				return {
-					content: [{ type: "text", text: "Another Agon repair operation is already in progress." }],
-					details: undefined,
-					isError: true,
-				};
-			}
-
-			isRepairActive = true;
-			try {
-				if (ctx.hasUI) {
-					ctx.ui.notify(`[Agon] Starting autonomous repair loop for check "${params.check_id}"...`, "info");
-				}
-				const res: AgonRepairResult = await bridge.repair(
-					params.check_id,
-					(event, _data) => {
-						if (ctx.hasUI) {
-							ctx.ui.notify(`[Agon] ${event}`, "info");
-						}
-					},
-					signal,
-				);
-
-				const isSuccess = res.outcome === "Fixed" || res.outcome === "Passed";
-				return {
-					content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
-					details: res,
-					isError: !isSuccess,
-				};
-			} catch (e) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Repair execution failed: ${e instanceof Error ? e.message : String(e)}`,
-						},
-					],
-					details: undefined,
-					isError: true,
-				};
-			} finally {
-				isRepairActive = false;
 			}
 		},
 	});

@@ -12,7 +12,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { AgonRepairResult, AgonStatusResult, AgonVerifyResult } from "../src/bridge.ts";
+import type { AgonStatusResult, AgonVerifyResult } from "../src/bridge.ts";
 import { agonExtension } from "../src/extension.ts";
 
 function setupFixture(name: string): string {
@@ -64,17 +64,18 @@ describe("agonExtension", () => {
 		},
 	} as unknown as ExtensionAPI;
 
-	const mockContext = (hasUI = false): ExtensionContext =>
+	const mockContext = (hasUI = false, isTrusted = true): ExtensionContext =>
 		({
 			cwd: fixtureDir,
 			hasUI,
+			isProjectTrusted: () => isTrusted,
 			ui: {
 				notify: () => {},
 				confirm: async () => false,
 			},
 		}) as unknown as ExtensionContext;
 
-	const mockToolContext: ExtensionToolContext = {} as unknown as ExtensionToolContext;
+	const getToolContext = (): ExtensionToolContext => mockContext() as unknown as ExtensionToolContext;
 
 	beforeAll(async () => {
 		fixtureDir = setupFixture("ext");
@@ -98,7 +99,7 @@ describe("agonExtension", () => {
 		expect(commands.agon).toBeDefined();
 		expect(tools.agon_status).toBeDefined();
 		expect(tools.agon_verify).toBeDefined();
-		expect(tools.agon_repair).toBeDefined();
+		expect(tools.agon_repair).toBeUndefined();
 	});
 
 	it("allows read tool calls without blocking", async () => {
@@ -144,6 +145,35 @@ describe("agonExtension", () => {
 		}
 	});
 
+	it("blocks git push powershell tool call by policy", async () => {
+		const toolCallHandlers = handlers.tool_call ?? [];
+		const event: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "3-ps",
+			toolName: "powershell",
+			input: { command: "git push origin main" },
+		};
+		for (const h of toolCallHandlers) {
+			const res = (await h(event, mockContext())) as ToolCallEventResult | undefined;
+			expect(res?.block).toBe(true);
+			expect(res?.reason).toContain("denied");
+		}
+	});
+
+	it("allows allowlisted powershell tool call without blocking", async () => {
+		const toolCallHandlers = handlers.tool_call ?? [];
+		const event: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "2-ps",
+			toolName: "powershell",
+			input: { command: "cargo test" },
+		};
+		for (const h of toolCallHandlers) {
+			const res = (await h(event, mockContext())) as ToolCallEventResult | undefined;
+			expect(res).toBeUndefined();
+		}
+	});
+
 	it("blocks write tool call when running without UI", async () => {
 		const toolCallHandlers = handlers.tool_call ?? [];
 		const event: ToolCallEvent = {
@@ -160,7 +190,7 @@ describe("agonExtension", () => {
 	});
 
 	it("executes agon_status tool and returns valid status", async () => {
-		const res = await tools.agon_status.execute("call-1", {}, undefined, undefined, mockToolContext);
+		const res = await tools.agon_status.execute("call-1", {}, undefined, undefined, getToolContext());
 		expect(res.isError).toBe(false);
 		expect(res.details).toBeDefined();
 		const status = res.details as AgonStatusResult;
@@ -173,11 +203,11 @@ describe("agonExtension", () => {
 			{ check_id: "verify.ok" },
 			undefined,
 			undefined,
-			mockToolContext,
+			getToolContext(),
 		);
 		expect(res.isError).toBe(false);
-		const verify = res.details as AgonVerifyResult;
-		expect(verify.passed).toBe(true);
+		const verifyList = res.details as AgonVerifyResult[];
+		expect(verifyList[0].passed).toBe(true);
 	});
 
 	it("executes agon_verify tool on failing check", async () => {
@@ -186,24 +216,33 @@ describe("agonExtension", () => {
 			{ check_id: "verify.fail" },
 			undefined,
 			undefined,
-			mockToolContext,
+			getToolContext(),
 		);
 		expect(res.isError).toBe(true);
-		const verify = res.details as AgonVerifyResult;
-		expect(verify.passed).toBe(false);
+		const verifyList = res.details as AgonVerifyResult[];
+		expect(verifyList[0].passed).toBe(false);
 	});
-	it("executes agon_repair tool on already passing check", async () => {
-		const res = await tools.agon_repair.execute(
-			"call-4",
-			{ check_id: "verify.ok" },
-			undefined,
-			undefined,
-			mockToolContext,
-		);
-		expect(res.isError).toBe(false);
-		expect(res.details).toBeDefined();
-		const details = res.details as AgonRepairResult;
-		expect(details.outcome).toBe("Passed");
+
+	it("does not expose agon_repair tool to models", () => {
+		expect(tools.agon_repair).toBeUndefined();
+	});
+
+	it("/agon repair refuses without interactive UI confirmation", async () => {
+		const notified: string[] = [];
+		const ctx = {
+			cwd: fixtureDir,
+			hasUI: false,
+			isProjectTrusted: () => true,
+			ui: {
+				notify: (msg: string) => {
+					notified.push(msg);
+				},
+				confirm: async () => false,
+			},
+		} as unknown as ExtensionCommandContext;
+
+		await commands.agon.handler("repair verify.ok", ctx);
+		expect(notified.some((m) => m.includes("requires interactive UI confirmation"))).toBe(true);
 	});
 
 	it("executes /agon init in unconfigured directory", async () => {
@@ -214,6 +253,7 @@ describe("agonExtension", () => {
 		const ctx = {
 			cwd: emptyDir,
 			hasUI: false,
+			isProjectTrusted: () => true,
 			ui: {
 				notify: (msg: string) => {
 					notified.push(msg);
@@ -225,5 +265,91 @@ describe("agonExtension", () => {
 		await commands.agon.handler("init", ctx);
 		expect(notified.some((m) => m.includes("Initialized Agon project in .agon/"))).toBe(true);
 		rmSync(emptyDir, { recursive: true, force: true });
+	});
+
+	it("blocks mutations but allows read when project is untrusted", async () => {
+		const toolCallHandlers = handlers.tool_call ?? [];
+		const readEvent: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "untrusted-read",
+			toolName: "read",
+			input: { path: "src/main.rs" },
+		};
+		const untrustedCtx = mockContext(false, false);
+		for (const h of toolCallHandlers) {
+			const res = (await h(readEvent, untrustedCtx)) as ToolCallEventResult | undefined;
+			expect(res).toBeUndefined();
+		}
+
+		const writeEvent: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "untrusted-write",
+			toolName: "write",
+			input: { path: "foo.txt", content: "bar" },
+		};
+		for (const h of toolCallHandlers) {
+			const res = (await h(writeEvent, untrustedCtx)) as ToolCallEventResult | undefined;
+			expect(res?.block).toBe(true);
+			expect(res?.reason).toContain("Project is not trusted");
+		}
+	});
+
+	it("allows read and blocks mutations when bridge is unavailable in configured project", async () => {
+		const brokenDir = join(tmpdir(), `agon-broken-${Date.now()}`);
+		mkdirSync(join(brokenDir, ".agon"), { recursive: true });
+		writeFileSync(join(brokenDir, ".agon/config.toml"), "invalid toml {{{");
+		const brokenCtx: ExtensionContext = {
+			cwd: brokenDir,
+			hasUI: false,
+			isProjectTrusted: () => true,
+			ui: { notify: () => {}, confirm: async () => false },
+		} as unknown as ExtensionContext;
+
+		const toolCallHandlers = handlers.tool_call ?? [];
+		const readEvent: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "broken-read",
+			toolName: "read",
+			input: { path: "src/main.rs" },
+		};
+		for (const h of toolCallHandlers) {
+			const res = (await h(readEvent, brokenCtx)) as ToolCallEventResult | undefined;
+			expect(res).toBeUndefined();
+		}
+
+		const bashEvent: ToolCallEvent = {
+			type: "tool_call",
+			toolCallId: "broken-bash",
+			toolName: "bash",
+			input: { command: "cargo test" },
+		};
+		for (const h of toolCallHandlers) {
+			const res = (await h(bashEvent, brokenCtx)) as ToolCallEventResult | undefined;
+			expect(res?.block).toBe(true);
+			expect(res?.reason).toContain("bridge unavailable");
+		}
+		rmSync(brokenDir, { recursive: true, force: true });
+	});
+
+	it("verifies multi-check when check_id is omitted", async () => {
+		const res = await tools.agon_verify.execute("call-multi", {}, undefined, undefined, getToolContext());
+		expect(res.details).toBeDefined();
+		const results = res.details as AgonVerifyResult[];
+		expect(Array.isArray(results)).toBe(true);
+		expect(results.length).toBeGreaterThanOrEqual(1);
+		for (const r of results) {
+			expect(r.check_id).toBeDefined();
+			expect(typeof r.passed).toBe("boolean");
+		}
+	});
+
+	it("session_start executes asynchronously without blocking", async () => {
+		const startHandlers = handlers.session_start ?? [];
+		const start = performance.now();
+		for (const h of startHandlers) {
+			await h({ type: "session_start", reason: "startup" }, mockContext());
+		}
+		const elapsed = performance.now() - start;
+		expect(elapsed).toBeLessThan(50);
 	});
 });

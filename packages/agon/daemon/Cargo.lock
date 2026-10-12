@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agon-bridge"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "agon-kernel",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agon-core"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "hex",
  "serde",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agon-kernel"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "agon-model",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agon-model"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "reqwest",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agon-morph"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "serde",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agon-policy"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "agon-morph",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "agon-verify"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "agon-core",
  "regex",

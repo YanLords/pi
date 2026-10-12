@@ -16,6 +16,7 @@ use agon_policy::{Action, Permission, Permissions};
 use agon_verify::run_check;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -51,7 +52,44 @@ pub struct Service {
     pub permissions: Permissions,
     pub registry: Registry,
     pub guard: Guard,
-    pub request_count: u64,
+    pub request_count: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct ServiceSnapshot {
+    pub root: PathBuf,
+    pub project: Project,
+    pub form: Form,
+    pub lock: Lockfile,
+    pub permissions: Permissions,
+    pub registry: Registry,
+    pub guard: Guard,
+}
+
+pub fn format_repair_outcome(outcome: Outcome) -> serde_json::Value {
+    match outcome {
+        Outcome::Passed => json!({ "outcome": "Passed" }),
+        Outcome::Flaky => json!({ "outcome": "Flaky" }),
+        Outcome::NoChange => json!({ "outcome": "NoChange" }),
+        Outcome::Fixed {
+            mutation,
+            proof,
+            form,
+        } => json!({
+            "outcome": "Fixed",
+            "mutation": mutation.0,
+            "proof": proof,
+            "form": form.0
+        }),
+        Outcome::HumanRequired { why } => {
+            let why_val = serde_json::to_value(&why)
+                .unwrap_or_else(|_| json!({ "reason": "unknown", "detail": format!("{why:?}") }));
+            json!({
+                "outcome": "HumanRequired",
+                "why": why_val
+            })
+        }
+    }
 }
 
 pub fn load_registry(project: &Project) -> Result<Registry, ServiceError> {
@@ -77,10 +115,10 @@ pub fn save_registry(project: &Project, registry: &Registry) -> Result<(), Servi
     Ok(())
 }
 
-pub fn save_forms(project: &Project, session: &Session) -> Result<(), ServiceError> {
+pub fn save_forms(project: &Project, forms: &[Form]) -> Result<(), ServiceError> {
     let dir = project.forms_dir();
     std::fs::create_dir_all(&dir).map_err(|e| ServiceError::Io(dir.display().to_string(), e))?;
-    for form in session.forms() {
+    for form in forms {
         let hex = form
             .id()
             .0
@@ -123,29 +161,7 @@ fn new_session(project: &Project) -> Result<Session, ServiceError> {
     Err(ServiceError::Other("could not allocate session id".into()))
 }
 
-impl Service {
-    pub fn new(root: &Path) -> Result<Self, ServiceError> {
-        let canonical = root
-            .canonicalize()
-            .map_err(|e| ServiceError::Io(root.display().to_string(), e))?;
-        let project = Project::load(&canonical)?;
-        let guard = Guard::snapshot(&canonical);
-        let registry = load_registry(&project)?;
-        let form = project.base_form();
-        let lock = project.resolve_lock();
-        let permissions = project.permissions();
-        Ok(Service {
-            root: canonical,
-            project,
-            form,
-            lock,
-            permissions,
-            registry,
-            guard,
-            request_count: 0,
-        })
-    }
-
+impl ServiceSnapshot {
     pub fn check_tampering(&self) -> Result<(), ServiceError> {
         let violations = self.guard.violations();
         if !violations.is_empty() {
@@ -154,68 +170,7 @@ impl Service {
         Ok(())
     }
 
-    pub fn hello(&mut self) -> Result<serde_json::Value, ServiceError> {
-        self.request_count += 1;
-        self.check_tampering()?;
-        let res = json!({
-            "protocol": 1,
-            "version": env!("CARGO_PKG_VERSION"),
-            "capabilities": ["status", "authorize", "verify", "repair", "shutdown"],
-            "agon_version": env!("CARGO_PKG_VERSION")
-        });
-        self.check_tampering()?;
-        Ok(res)
-    }
-
-    pub fn status(&mut self) -> Result<serde_json::Value, ServiceError> {
-        self.request_count += 1;
-        let violations = self.guard.violations();
-        let active_checks: Vec<String> = self.form.checks.keys().map(|k| k.0.clone()).collect();
-        let lock_hash = agon_core::sha256_of(&self.lock)
-            .map(|d| d.to_string())
-            .unwrap_or_default();
-        let budget = &self.project.config.morph.budget;
-
-        Ok(json!({
-            "form_id": self.form.id().0,
-            "lock_hash": lock_hash,
-            "active_checks": active_checks,
-            "budget": budget,
-            "registry_size": self.registry.len(),
-            "tampering_violations": violations
-        }))
-    }
-
-    pub fn authorize(
-        &mut self,
-        action_str: &str,
-        detail: &str,
-    ) -> Result<serde_json::Value, ServiceError> {
-        self.request_count += 1;
-        self.check_tampering()?;
-        let action = match action_str {
-            "read" => Action::Read,
-            "search" => Action::Search,
-            "write" => Action::Write,
-            "edit" => Action::Edit,
-            "shell" => Action::Shell,
-            "git_commit" => Action::GitCommit,
-            "git_push" => Action::GitPush,
-            other => return Err(ServiceError::UnknownAction(other.to_string())),
-        };
-
-        let decision = self.permissions.decide(action, detail);
-        let res = match decision {
-            Permission::Allow => json!({ "verdict": "allow" }),
-            Permission::Confirm { reason } => json!({ "verdict": "confirm", "reason": reason }),
-            Permission::Deny { reason } => json!({ "verdict": "deny", "reason": reason }),
-        };
-        self.check_tampering()?;
-        Ok(res)
-    }
-
-    pub fn verify(&mut self, check_id: Option<&str>) -> Result<serde_json::Value, ServiceError> {
-        self.request_count += 1;
+    pub fn verify(&self, check_id: Option<&str>) -> Result<serde_json::Value, ServiceError> {
         self.check_tampering()?;
         let form = &self.form;
         let ids: Vec<CheckId> = match check_id {
@@ -262,22 +217,17 @@ impl Service {
         }
 
         self.check_tampering()?;
-        if results.len() == 1 {
-            Ok(results.remove(0))
-        } else {
-            Ok(json!({ "results": results }))
-        }
+        Ok(json!({ "results": results }))
     }
 
-    pub async fn repair<F>(
-        &mut self,
+    pub async fn execute_repair<F>(
+        &self,
         check_id: &str,
         on_event: F,
-    ) -> Result<serde_json::Value, ServiceError>
+    ) -> Result<(Outcome, Form, Registry, Vec<Form>), ServiceError>
     where
         F: Fn(&str, serde_json::Value) + Send + Sync + 'static,
     {
-        self.request_count += 1;
         self.check_tampering()?;
         let id = CheckId(check_id.to_string());
         if !self.project.catalog.contains_key(&id) {
@@ -343,7 +293,6 @@ impl Service {
             equivalences: vec![],
         };
 
-        let known_before = self.registry.len();
         let decisions = LazyJev::new(
             self.project.jev_config(),
             self.project.config.jev.api_key_env.clone(),
@@ -363,42 +312,163 @@ impl Service {
         })?;
 
         let outcome = kernel.repair(&id).await?;
+        let new_form = kernel.history().current().clone();
+        let forms: Vec<Form> = kernel
+            .session()
+            .forms()
+            .iter()
+            .map(|f| (*f).clone())
+            .collect();
+        let new_registry = kernel.into_registry();
 
-        // Persister les Forms et le registre
-        save_forms(&self.project, kernel.session())?;
-        if kernel.registry().len() != known_before {
-            save_registry(&self.project, kernel.registry())?;
+        Ok((outcome, new_form, new_registry, forms))
+    }
+}
+
+impl Service {
+    pub fn new(root: &Path) -> Result<Self, ServiceError> {
+        let canonical = root
+            .canonicalize()
+            .map_err(|e| ServiceError::Io(root.display().to_string(), e))?;
+        let project = Project::load(&canonical)?;
+        let guard = Guard::snapshot(&canonical);
+        let registry = load_registry(&project)?;
+        let form = project.base_form();
+        let lock = project.resolve_lock();
+        let permissions = project.permissions();
+        Ok(Service {
+            root: canonical,
+            project,
+            form,
+            lock,
+            permissions,
+            registry,
+            guard,
+            request_count: AtomicU64::new(0),
+        })
+    }
+
+    pub fn snapshot(&self) -> ServiceSnapshot {
+        ServiceSnapshot {
+            root: self.root.clone(),
+            project: self.project.clone(),
+            form: self.form.clone(),
+            lock: self.lock.clone(),
+            permissions: self.permissions.clone(),
+            registry: self.registry.clone(),
+            guard: self.guard.clone(),
         }
-        self.form = kernel.history().current().clone();
-        self.registry = kernel.into_registry();
-        self.guard = Guard::snapshot(&self.root);
+    }
 
-        let res = match outcome {
-            Outcome::Passed => json!({ "outcome": "Passed" }),
-            Outcome::Flaky => json!({ "outcome": "Flaky" }),
-            Outcome::NoChange => json!({ "outcome": "NoChange" }),
-            Outcome::Fixed {
-                mutation,
-                proof,
-                form,
-            } => json!({
-                "outcome": "Fixed",
-                "mutation": mutation.0,
-                "proof": proof,
-                "form": form.0
-            }),
-            Outcome::HumanRequired { why } => json!({
-                "outcome": "HumanRequired",
-                "why": format!("{why:?}")
-            }),
-        };
+    pub fn check_tampering(&self) -> Result<(), ServiceError> {
+        let violations = self.guard.violations();
+        if !violations.is_empty() {
+            return Err(ServiceError::Tampering(violations));
+        }
+        Ok(())
+    }
 
+    pub fn hello(&self) -> Result<serde_json::Value, ServiceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.check_tampering()?;
+        let res = json!({
+            "protocol": 1,
+            "version": env!("CARGO_PKG_VERSION"),
+            "capabilities": ["status", "authorize", "verify", "repair", "shutdown"],
+            "agon_version": env!("CARGO_PKG_VERSION")
+        });
         self.check_tampering()?;
         Ok(res)
     }
 
-    pub fn shutdown(&mut self) -> Result<serde_json::Value, ServiceError> {
-        self.request_count += 1;
+    pub fn status(&self) -> Result<serde_json::Value, ServiceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        let violations = self.guard.violations();
+        let active_checks: Vec<String> = self.form.checks.keys().map(|k| k.0.clone()).collect();
+        let lock_hash = agon_core::sha256_of(&self.lock)
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let budget = &self.project.config.morph.budget;
+
+        Ok(json!({
+            "form_id": self.form.id().0,
+            "lock_hash": lock_hash,
+            "active_checks": active_checks,
+            "budget": budget,
+            "registry_size": self.registry.len(),
+            "tampering_violations": violations
+        }))
+    }
+
+    pub fn authorize(
+        &self,
+        action_str: &str,
+        detail: &str,
+    ) -> Result<serde_json::Value, ServiceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.check_tampering()?;
+        let action = match action_str {
+            "read" => Action::Read,
+            "search" => Action::Search,
+            "write" => Action::Write,
+            "edit" => Action::Edit,
+            "shell" => Action::Shell,
+            "git_commit" => Action::GitCommit,
+            "git_push" => Action::GitPush,
+            other => return Err(ServiceError::UnknownAction(other.to_string())),
+        };
+
+        let decision = self.permissions.decide(action, detail);
+        let res = match decision {
+            Permission::Allow => json!({ "verdict": "allow" }),
+            Permission::Confirm { reason } => json!({ "verdict": "confirm", "reason": reason }),
+            Permission::Deny { reason } => json!({ "verdict": "deny", "reason": reason }),
+        };
+        self.check_tampering()?;
+        Ok(res)
+    }
+
+    pub fn verify(&self, check_id: Option<&str>) -> Result<serde_json::Value, ServiceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.snapshot().verify(check_id)
+    }
+
+    pub fn apply_repair_result(
+        &mut self,
+        new_form: Form,
+        new_registry: Registry,
+        forms: &[Form],
+    ) -> Result<(), ServiceError> {
+        self.check_tampering()?;
+        save_forms(&self.project, forms)?;
+        if new_registry.len() != self.registry.len() {
+            save_registry(&self.project, &new_registry)?;
+        }
+        self.form = new_form;
+        self.registry = new_registry;
+        self.guard = Guard::snapshot(&self.root);
+        self.check_tampering()?;
+        Ok(())
+    }
+
+    pub async fn repair<F>(
+        &mut self,
+        check_id: &str,
+        on_event: F,
+    ) -> Result<serde_json::Value, ServiceError>
+    where
+        F: Fn(&str, serde_json::Value) + Send + Sync + 'static,
+    {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        let snap = self.snapshot();
+        let (outcome, new_form, new_registry, forms) =
+            snap.execute_repair(check_id, on_event).await?;
+        self.apply_repair_result(new_form, new_registry, &forms)?;
+        Ok(format_repair_outcome(outcome))
+    }
+
+    pub fn shutdown(&self) -> Result<serde_json::Value, ServiceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         kill_active_processes();
         Ok(json!({ "status": "shutdown" }))
     }
@@ -440,7 +510,7 @@ success = "exit_code == 0"
     #[test]
     fn service_initialization_and_status() {
         let root = temp_project("init", &[("config.toml", CFG), ("checks.toml", CHECKS)]);
-        let mut s = Service::new(&root).unwrap();
+        let s = Service::new(&root).unwrap();
 
         let hello = s.hello().unwrap();
         assert_eq!(hello["protocol"], 1);
@@ -454,7 +524,7 @@ success = "exit_code == 0"
     #[test]
     fn service_authorization() {
         let root = temp_project("auth", &[("config.toml", CFG), ("checks.toml", CHECKS)]);
-        let mut s = Service::new(&root).unwrap();
+        let s = Service::new(&root).unwrap();
 
         assert_eq!(
             s.authorize("read", "src/lib.rs").unwrap()["verdict"],
@@ -475,22 +545,22 @@ success = "exit_code == 0"
     #[test]
     fn service_verify_success_and_failure() {
         let root = temp_project("verify", &[("config.toml", CFG), ("checks.toml", CHECKS)]);
-        let mut s = Service::new(&root).unwrap();
+        let s = Service::new(&root).unwrap();
 
         let ok = s.verify(Some("verify.ok")).unwrap();
-        assert_eq!(ok["passed"], true);
-        assert_eq!(ok["exit_code"], 0);
+        assert_eq!(ok["results"][0]["passed"], true);
+        assert_eq!(ok["results"][0]["exit_code"], 0);
 
         let fail = s.verify(Some("verify.fail")).unwrap();
-        assert_eq!(fail["passed"], false);
-        assert_ne!(fail["exit_code"], 0);
+        assert_eq!(fail["results"][0]["passed"], false);
+        assert_ne!(fail["results"][0]["exit_code"], 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn tampering_blocks_operations() {
         let root = temp_project("tamper", &[("config.toml", CFG), ("checks.toml", CHECKS)]);
-        let mut s = Service::new(&root).unwrap();
+        let s = Service::new(&root).unwrap();
         assert!(s.check_tampering().is_ok());
 
         // Modifie checks.toml

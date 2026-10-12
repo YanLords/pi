@@ -152,6 +152,7 @@ const POLICY_FILES: &[&str] = &[
 ];
 
 /// Instantané du contenu des fichiers de politique de `.agon/`.
+#[derive(Clone, Debug)]
 pub struct Guard {
     root: PathBuf,
     before: Vec<(String, Option<Digest>)>,
